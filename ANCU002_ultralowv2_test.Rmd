@@ -1,0 +1,190 @@
+---
+title: "ANCU002_ultralowv2_test"
+author: "Antton Alberdi"
+date: "2024-02-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Load libraries
+
+```{r libraries, warning=FALSE, comments="", message=FALSE}
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(tinytable))
+suppressPackageStartupMessages(library(rairtable))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(ggh4x))
+```
+
+## Load metadata
+
+The sample metadata contains information about the bacterial culture and buffer employed for each sample. After loading that information from airtable, the bacterial culture mapping expectations are calculated for each sample.
+
+```{r sample_metadata, warning=FALSE, comments="", message=FALSE}
+sample_metadata <- airtable("4-CSE-Info", "app94YGZqsqwARtWo") %>% #get base ID from Airtable browser URL
+  read_airtable(., fields = c("ID","BacteriaIDs","Lysis_buffer","LabBatch_text"), id_to_col = TRUE) %>% #get 3 columns from MAGs table
+  filter(LabBatch_text == "CSEB002") %>%
+  select(ID,BacteriaIDs,Lysis_buffer) %>%
+  rename(sample=1,culture=2,buffer=3) %>%
+  # Add expectations
+  mutate(expSR = case_when(
+    culture=="SR" ~ 1,
+    culture=="MX" ~ 0.25,
+    culture=="NG" ~ 0,
+    TRUE ~ 0
+  )) %>%
+  mutate(expXR = case_when(
+    culture=="XR" ~ 1,
+    culture=="MX" ~ 0.25,
+    culture=="NG" ~ 0,
+    TRUE ~ 0
+  )) %>%
+  mutate(expMO = case_when(
+    culture=="MO" ~ 1,
+    culture=="MX" ~ 0.25,
+    culture=="NG" ~ 0,
+    TRUE ~ 0
+  )) %>%
+   mutate(expPA = case_when(
+    culture=="PA" ~ 1,
+    culture=="MX" ~ 0.25,
+    culture=="NG" ~ 0,
+    TRUE ~ 0
+  ))
+```
+
+Relevant metadata of the genomes is added for downstream analyses
+
+```{r genome_metadata, warning=FALSE, comments="", message=FALSE}
+genome_metadata <- tibble(genome=c("SR","XR","MO","PA"),
+                       species=c("Stenotrophomonas rhizophila","Xanthomonas retroflexus","Microbacterium oxydans","Paenibacillus amylolyticus"),
+                       length=c(4216903,4655568,3989887,7273724),
+                       gram=c("negative","negative","positive","positive"))
+```
+
+## Load data
+
+```{r load_counts, warning=FALSE, comments="", message=FALSE}
+read_counts <- read_tsv("data/coverm_genome_joint.count.tsv") %>%
+  rename_all(~ str_remove_all(., ".lib1")) %>% #simplify column names
+  rename(genome = 1) %>%
+  mutate(genome = case_when(
+    genome=="pamy" ~ "PA",
+    genome=="moxy" ~ "MO",
+    genome=="shri" ~ "SR",
+    genome=="xret" ~ "XR",
+    TRUE ~ genome
+  )) %>%
+  arrange(match(genome, genome_metadata$genome))
+```
+
+```{r genome_coverage, warning=FALSE, comments="", message=FALSE}
+genome_coverage <- read_tsv("data/coverm_genome_joint.covered_bases.tsv") %>%
+  rename_all(~ str_remove_all(., ".lib1")) %>% #simplify column names
+  rename(genome = 1) %>%
+  mutate(genome = case_when(
+    genome=="pamy" ~ "PA",
+    genome=="moxy" ~ "MO",
+    genome=="shri" ~ "SR",
+    genome=="xret" ~ "XR",
+    TRUE ~ genome
+  )) %>%
+  arrange(match(genome, genome_metadata$genome)) %>%
+  mutate(across(where(is.numeric), ~ ./genome_metadata$length))
+```
+
+## Filter and transform reads
+
+```{r filter_coverage, warning=FALSE, comments="", message=FALSE}
+min_coverage=0.3
+read_counts_filt <- genome_coverage %>%
+  mutate(across(where(is.numeric), ~ ifelse(. > min_coverage, 1, 0))) %>%
+  mutate(across(-1, ~ . * read_counts[[cur_column()]])) 
+```
+
+```{r genome_counts, warning=FALSE, comments="", message=FALSE}
+readlength=150 #change if sequencing read length is different
+genome_counts <- read_counts_filt %>%
+  mutate(across(where(is.numeric), ~ . / (genome_metadata$length / readlength) ))
+```
+
+## Community composition
+
+```{r community_composition, warning=FALSE, comments="", message=FALSE, fig.height=8, fig.width=10, fig.fullwidth=TRUE}
+# Plot figure
+genome_counts %>%
+  mutate_at(vars(-genome),~./sum(.)) %>% #apply TSS nornalisation
+  pivot_longer(-genome, names_to = "sample", values_to = "count") %>% #reduce to minimum number of columns
+  left_join(., genome_metadata, by = join_by(genome == genome)) %>% #append genome metadata
+  left_join(., sample_metadata, by = join_by(sample == sample)) %>% #append sample metadata
+  mutate(buffer=unlist(buffer)) %>%
+  mutate(culture=unlist(culture)) %>%
+  mutate(culture=factor(culture,levels=c("MX","PA","MO","XR","SR"))) %>%
+  filter(!is.na(count)) %>%
+  ggplot(., aes(x=count,y=sample, fill=genome, group=genome)) + #grouping enables keeping the same sorting of taxonomic units
+    geom_bar(stat="identity", colour="white", linewidth=0.1) + #plot stacked bars with white borders
+    scale_fill_manual(values=c("#264653","#2A9D8F","#E9C46A","#E76F51")) +
+    labs(y = "Relative abundance") +
+    facet_nested(culture + buffer ~ .,  scales="free") + #facet per day and treatment
+    guides(fill = guide_legend(ncol = 1)) +
+    theme(strip.text.y = element_text(angle = 0),
+          axis.text.y = element_blank(),
+          axis.title.x = element_blank(),
+          panel.background = element_blank(),
+          panel.border = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.line = element_line(linewidth = 0.5, linetype = "solid", colour = "black"),
+          panel.spacing = unit(0, "lines")) +
+   labs(x="Relative abundance", y="Sample", fill="Microbial species")
+```
+
+## Performance
+
+The difference between the expected and observed relative abundances is calculated for the mixed culture samples.
+
+```{r performance, warning=FALSE, comments="", message=FALSE}
+performance <- genome_counts %>%
+  mutate_at(vars(-genome),~./sum(.)) %>% #apply TSS nornalisation
+  pivot_longer(!genome, names_to = "sample", values_to = "count") %>% 
+  left_join(sample_metadata, by=join_by(sample==sample)) %>%
+  filter(!is.na(count))  %>%
+  filter(unlist(culture) == "MX") %>%
+  mutate(SR_diff = abs(count - expSR),
+         XR_diff = abs(count - expXR),
+         MO_diff = abs(count - expMO),
+         PA_diff = abs(count - expPA)) %>%
+  rowwise() %>%
+  mutate(MAE = mean(c_across(c(SR_diff, XR_diff, MO_diff, PA_diff)), na.rm = TRUE)) %>%
+  mutate(MSE = mean(c_across(c(SR_diff, XR_diff, MO_diff, PA_diff))^2, na.rm = TRUE)) %>%
+  mutate(RMSE = sqrt(MSE))
+```
+
+### RMSE plot
+
+The root-mean-square deviation (RMSE) is a measure of accuracy to compare forecasting errors. A value of 0 would indicate a perfect fit between expected (25% of reads mapped to each genopme) and observed values.
+
+```{r performance_plot, warning=FALSE, comments="", message=FALSE, fig.height=6, fig.width=10, fig.fullwidth=TRUE}
+performance %>% 
+  select(sample,culture,buffer,RMSE) %>% 
+  mutate(buffer=unlist(buffer)) %>%
+  ggplot(aes(x=buffer,y=RMSE)) +
+    geom_boxplot() +
+    theme_classic() +
+    labs(x="Lysis buffer",y="RMSE")
+```
+The lower the value the better. B11 is the one showing the closest values of the expected 25-25-25-25% in the mixed culture.
+
+```{r performance_stats, warning=FALSE, comments="", message=FALSE}
+performance %>% 
+  select(sample,culture,buffer,RMSE) %>% 
+  mutate(buffer=unlist(buffer)) %>%
+  pivot_longer(!c(sample,culture,buffer), names_to = "metric", values_to = "value") %>% 
+  kruskal.test(value ~ buffer, data = .)
+```
+
+While B11 exhibits the best RMSE, the differences are near-significant.
